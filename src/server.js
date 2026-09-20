@@ -10,6 +10,28 @@ const { analyzeMessage } = require("./gemini");
 const { searchWeb } = require("./search");
 const { getUsage, ensureRowExists, LIMITS } = require("./usage");
 const { version } = require("../package.json");
+
+const APP_TIMEZONE = process.env.APP_TIMEZONE || "Asia/Singapore";
+
+// Short-lived in-memory cache for forwarded/replied-to message context.
+// No extra Supabase table is required; if the service restarts, the user can simply forward again.
+const forwardedContext = new Map();
+const FORWARDED_CONTEXT_TTL_MS = 24 * 60 * 60 * 1000;
+
+function rememberForwardedContext(phone, text) {
+  if (!text) return;
+  forwardedContext.set(phone, { text: text.trim(), savedAt: Date.now() });
+}
+
+function getForwardedContext(phone) {
+  const item = forwardedContext.get(phone);
+  if (!item) return null;
+  if (Date.now() - item.savedAt > FORWARDED_CONTEXT_TTL_MS) {
+    forwardedContext.delete(phone);
+    return null;
+  }
+  return item.text;
+}
 const { getHeartbeats, runReminderDispatch, runRoutineDispatch, runRecurringDispatch } = require("./scheduler");
 
 // Prevent unhandled rejections/exceptions from crashing the process and killing cron jobs
@@ -85,7 +107,7 @@ app.get("/status", (req, res) => {
 // HELPERS
 // ---------------------------------------------------------
 
-// Converts AI-extracted HH:MM:SS to a full IST-offset ISO timestamp
+// Converts AI-extracted HH:MM:SS to a full local-time ISO timestamp
 function buildReminderDate(timeString, dateString = null) {
   const now = new Date();
 
@@ -95,7 +117,7 @@ function buildReminderDate(timeString, dateString = null) {
   }
 
   const formatter = new Intl.DateTimeFormat("en-US", {
-    timeZone: "Asia/Kolkata",
+    timeZone: APP_TIMEZONE,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -327,6 +349,81 @@ app.post("/webhook", async (req, res) => {
   const senderPhone = messageData.from;
   const lowerMsg = message.toLowerCase().trim();
 
+  // Fast-path acknowledgement commands for reminders that keep nagging until done.
+  // These bypass AI so "DONE" is deterministic and costs no model quota.
+  if (/^(done|completed|complete|finished)$/i.test(lowerMsg)) {
+    const { data: activeNag } = await supabase
+      .from("personal_reminders")
+      .select("id, message")
+      .eq("phone", senderPhone)
+      .eq("status", "pending")
+      .like("group_name", "nag:%")
+      .order("reminder_time", { ascending: true })
+      .limit(1);
+
+    if (!activeNag?.length) {
+      return await replyAndLog(senderPhone, "Owner", message, "No active nagging reminder found.");
+    }
+
+    await supabase
+      .from("personal_reminders")
+      .update({ status: "completed" })
+      .eq("id", activeNag[0].id)
+      .eq("status", "pending");
+
+    return await replyAndLog(
+      senderPhone,
+      "Owner",
+      message,
+      `Done ✓ I stopped reminding you about: "${activeNag[0].message}"`
+    );
+  }
+
+  const snoozeMatch = lowerMsg.match(/^snooze(?:\s+(\d+))?$/i);
+  if (snoozeMatch) {
+    const snoozeMinutes = Math.max(5, parseInt(snoozeMatch[1] || "30", 10));
+    const { data: activeNag } = await supabase
+      .from("personal_reminders")
+      .select("id, message")
+      .eq("phone", senderPhone)
+      .eq("status", "pending")
+      .like("group_name", "nag:%")
+      .order("reminder_time", { ascending: true })
+      .limit(1);
+
+    if (!activeNag?.length) {
+      return await replyAndLog(senderPhone, "Owner", message, "No active nagging reminder found.");
+    }
+
+    const until = new Date(Date.now() + snoozeMinutes * 60 * 1000).toISOString();
+    await supabase
+      .from("personal_reminders")
+      .update({ reminder_time: until })
+      .eq("id", activeNag[0].id)
+      .eq("status", "pending");
+
+    return await replyAndLog(
+      senderPhone,
+      "Owner",
+      message,
+      `Snoozed for ${snoozeMinutes} minutes.`
+    );
+  }
+
+  // WhatsApp includes a context object when a message is a reply/forward in supported webhook payloads.
+  // Keep the actual forwarded text as the subject; a following "remind me about this..." can reuse it.
+  const looksForwarded = Boolean(messageData.context) ||
+    /^(forwarded|fwd:|fw:)/i.test(message.trim());
+  if (looksForwarded && !/\bremind\s+me\b/i.test(message)) {
+    rememberForwardedContext(senderPhone, message);
+    return await replyAndLog(
+      senderPhone,
+      "Owner",
+      message,
+      'Got it. Now tell me when to remind you, e.g. "tomorrow at 10am, keep reminding me every hour until done."'
+    );
+  }
+
   // Rate limit: max 10 messages/minute per sender
   if (isRateLimited(senderPhone)) {
     console.warn(`[webhook] Rate limit hit for ${senderPhone}`);
@@ -391,6 +488,15 @@ app.post("/webhook", async (req, res) => {
   // 5. AI INTENT ANALYSIS (with memory context)
   const aiResult = await analyzeMessage(message, false, history);
   const { intent, targetName, time, date, taskOrMessage, ai_meta } = aiResult;
+
+  // If the user says "this/that/it/the forwarded message", use the cached forwarded text.
+  const forwardedText = getForwardedContext(senderPhone);
+  const refersToForwarded = /\b(this|that|it|forwarded(?: message)?|above message)\b/i.test(message);
+  if (forwardedText && refersToForwarded &&
+      ["reminder", "interval_reminder", "nag_reminder"].includes(intent)) {
+    aiResult.taskOrMessage = forwardedText;
+  }
+  const effectiveTaskOrMessage = aiResult.taskOrMessage ?? taskOrMessage;
 
   // respond() is the single exit point — appends ai_meta automatically
   const respond = async (responseText, overrideAiMeta) => {
@@ -587,7 +693,7 @@ app.post("/webhook", async (req, res) => {
           text += "One-off Reminders:\n\n";
           oneOff.forEach((r) => {
             const t = new Date(r.reminder_time).toLocaleString("en-US", {
-              timeZone: "Asia/Kolkata", month: "short", day: "numeric",
+              timeZone: APP_TIMEZONE, month: "short", day: "numeric",
               hour: "numeric", minute: "2-digit", hour12: true,
             });
             text += `- [${t}] ${r.group_name ? r.group_name + ": " : ""}${r.message}\n`;
@@ -603,7 +709,7 @@ app.post("/webhook", async (req, res) => {
           });
           Object.entries(grouped).forEach(([msg, times]) => {
             const next = new Date(times[0]).toLocaleString("en-US", {
-              timeZone: "Asia/Kolkata", hour: "numeric", minute: "2-digit", hour12: true,
+              timeZone: APP_TIMEZONE, hour: "numeric", minute: "2-digit", hour12: true,
             });
             text += `- "${msg}" — ${times.length} alerts remaining, next at ${next}\n`;
           });
@@ -699,7 +805,7 @@ app.post("/webhook", async (req, res) => {
         text += `\nReminders:\n`;
         reminders.forEach((r) => {
           const t = new Date(r.reminder_time).toLocaleTimeString("en-US", {
-            timeZone: "Asia/Kolkata",
+            timeZone: APP_TIMEZONE,
             hour: "numeric",
             minute: "2-digit",
             hour12: true,
@@ -801,11 +907,11 @@ app.post("/webhook", async (req, res) => {
 
     if (intent === "reminder") {
       if (!time) return await respond("Please specify a time for the reminder.");
-      if (!taskOrMessage || taskOrMessage.trim() === "") return await respond("Please specify what the reminder is for.");
+      if (!effectiveTaskOrMessage || effectiveTaskOrMessage.trim() === "") return await respond("Please specify what the reminder is for.");
       const dbTimestamp = buildReminderDate(time, date || null);
       const { error } = await supabase.from("personal_reminders").insert([{
         phone: targetPhone,
-        message: taskOrMessage,
+        message: effectiveTaskOrMessage,
         reminder_time: dbTimestamp,
         group_name: finalName.toLowerCase() === "you" ? null : finalName,
       }]);
@@ -816,10 +922,33 @@ app.post("/webhook", async (req, res) => {
       );
     }
 
+    if (intent === "nag_reminder") {
+      const intervalMins = Math.max(5, parseInt(aiResult.intervalMinutes) || 60);
+      const task = effectiveTaskOrMessage || getForwardedContext(senderPhone);
+
+      if (!time) return await respond("Please specify when the first reminder should happen.");
+      if (!task) return await respond("Please tell me what to remind you about.");
+
+      const dbTimestamp = buildReminderDate(time, date || null);
+      const { error } = await supabase.from("personal_reminders").insert([{
+        phone: targetPhone,
+        message: task,
+        reminder_time: dbTimestamp,
+        group_name: `nag:${intervalMins}`,
+        status: "pending",
+      }]);
+
+      return await respond(
+        !error
+          ? `Reminder set for ${formatTimeDisplay(time)}. I’ll keep reminding you every ${intervalMins} minutes until you reply DONE. You can also reply SNOOZE 30.`
+          : "Failed to save reminder. Please try again."
+      );
+    }
+
     if (intent === "interval_reminder") {
       const intervalMins = parseInt(aiResult.intervalMinutes);
       const durationHrs = parseInt(aiResult.durationHours) || 8;
-      const task = taskOrMessage || "reminder";
+      const task = effectiveTaskOrMessage || "reminder";
 
       if (!intervalMins || intervalMins < 1) {
         return await respond("Please specify how often — e.g. every 30 minutes.");

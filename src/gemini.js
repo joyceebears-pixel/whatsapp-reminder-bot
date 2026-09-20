@@ -69,7 +69,7 @@ function formatForWhatsApp(text) {
 async function analyzeMessage(userMessage, isSummaryRequest = false, history = []) {
   const usageStats = await getUsage();
   const currentIST = new Date().toLocaleString("en-US", {
-    timeZone: "Asia/Kolkata",
+    timeZone: process.env.APP_TIMEZONE || "Asia/Singapore",
     hour12: false,
   });
 
@@ -89,7 +89,7 @@ async function analyzeMessage(userMessage, isSummaryRequest = false, history = [
 - "query_birthday": Use ONLY when the user is ASKING FOR INFORMATION about an existing birthday (e.g., 'When is Manu's birthday?'). Do NOT use this if they are trying to save a date.
 - "instant_message": Use to forward messages.
 - "routine" intent is ONLY for fixed daily time (e.g., "every day at 9 AM"). NOT for interval-based reminders.
-- "interval_reminder": Use when the user says "every X minutes", "every X hours". Extract intervalMinutes and durationHours (default 8).
+- "interval_reminder": Use when the user says "every X minutes", "every X hours" for a FINITE repeating window. Extract intervalMinutes and durationHours (default 8).\n- "nag_reminder": Use when the user wants a reminder that KEEPS repeating UNTIL they confirm completion, e.g. "keep reminding me every hour until done", "nag me every 30 minutes until I do it", or "do not stop reminding me until I say done". Extract intervalMinutes; default to 60 if no repeat interval is stated. Extract the first reminder time/date normally.
 - "weekly_reminder": Use when the user says "every Monday", "every Tuesday night", "each week on Friday". Extract dayOfWeek as a number (0=Sunday, 1=Monday, 2=Tuesday, 3=Wednesday, 4=Thursday, 5=Friday, 6=Saturday).
 - "monthly_reminder": Use when the user says "every month on the 1st", "on the 15th of every month", "remind me monthly". Extract dayOfMonth as a number (1-31).
 - "delete_task": extract ONLY the core task name. Strip words like "routine", "reminder", "task", "event" from taskOrMessage.
@@ -101,7 +101,7 @@ async function analyzeMessage(userMessage, isSummaryRequest = false, history = [
 
   JSON structure:
   {
-  "intent": "reminder" | "routine" | "interval_reminder" | "weekly_reminder" | "monthly_reminder" | "event" | "instant_message" | "chat" | "query_birthday" | "query_schedule" | "query_routines" | "query_contacts" | "query_reminders" | "query_events" | "delete_task" | "edit_task" | "save_contact" | "web_search" | "unknown",
+  "intent": "reminder" | "routine" | "interval_reminder" | "nag_reminder" | "weekly_reminder" | "monthly_reminder" | "event" | "instant_message" | "chat" | "query_birthday" | "query_schedule" | "query_routines" | "query_contacts" | "query_reminders" | "query_events" | "delete_task" | "edit_task" | "save_contact" | "web_search" | "unknown",
   "targetName": "you" (if message is for Viswanath) OR the extracted name,
   "time": "HH:MM:SS" (24-hour format, IST timezone, or null),
   "date": "YYYY-MM-DD" (if a date is mentioned or calculable, or null),
@@ -157,7 +157,7 @@ async function analyzeMessage(userMessage, isSummaryRequest = false, history = [
   Message: "Remind me every 30 minutes to drink water"
   JSON: {"intent": "interval_reminder", "targetName": "you", "time": null, "date": null, "taskOrMessage": "drink water", "intervalMinutes": 30, "durationHours": 8}
 
-  Message: "Save mom as 919876543210"
+  Message: "Remind me tomorrow at 10 AM and keep reminding me every hour until done"\n  JSON: {"intent": "nag_reminder", "targetName": "you", "time": "10:00:00", "date": null, "taskOrMessage": "this", "intervalMinutes": 60, "durationHours": null}\n\n  Message: "Save mom as 919876543210"
   JSON: {"intent": "save_contact", "targetName": "Mom", "time": null, "date": null, "taskOrMessage": "Mom", "phone": "919876543210"}
 
   ${

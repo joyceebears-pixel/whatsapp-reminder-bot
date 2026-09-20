@@ -4,11 +4,21 @@ const sendWhatsAppMessage = require("./sendMessage");
 const supabase = require("./supabase");
 const { ensureRowExists } = require("./usage");
 
-function getISTComponents() {
+const APP_TIMEZONE = process.env.APP_TIMEZONE || "Asia/Singapore";
+const REMINDER_TEMPLATE_NAME = process.env.REMINDER_TEMPLATE_NAME || "";
+const REMINDER_TEMPLATE_LANGUAGE = process.env.REMINDER_TEMPLATE_LANGUAGE || "en_US";
+
+function scheduledMessageOptions() {
+  return REMINDER_TEMPLATE_NAME
+    ? { templateName: REMINDER_TEMPLATE_NAME, languageCode: REMINDER_TEMPLATE_LANGUAGE }
+    : {};
+}
+
+function getLocalComponents() {
   const now = new Date();
 
   const formatter = new Intl.DateTimeFormat("en-IN", {
-    timeZone: "Asia/Kolkata",
+    timeZone: APP_TIMEZONE,
     year: "numeric",
     month: "numeric",
     day: "numeric",
@@ -17,7 +27,7 @@ function getISTComponents() {
   const [{ value: day }, , { value: month }] = formatter.formatToParts(now);
 
   const dowFormatter = new Intl.DateTimeFormat("en-US", {
-    timeZone: "Asia/Kolkata",
+    timeZone: APP_TIMEZONE,
     weekday: "short",
   });
   const dowMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
@@ -27,11 +37,11 @@ function getISTComponents() {
     day: parseInt(day),
     month: parseInt(month),
     dayOfWeek: dowMap[dowStr],
-    todayIST: new Intl.DateTimeFormat("en-CA", {
-      timeZone: "Asia/Kolkata",
+    todayLocal: new Intl.DateTimeFormat("en-CA", {
+      timeZone: APP_TIMEZONE,
     }).format(now),
     timeStr: new Intl.DateTimeFormat("en-GB", {
-      timeZone: "Asia/Kolkata",
+      timeZone: APP_TIMEZONE,
       hour: "2-digit",
       minute: "2-digit",
       hour12: false,
@@ -84,7 +94,44 @@ async function runReminderDispatch() {
       .eq("status", "pending");
 
     for (const reminder of dueReminders || []) {
-      // Atomic claim — skips row if already taken by a concurrent dispatcher
+      const isNagReminder =
+        typeof reminder.group_name === "string" && reminder.group_name.startsWith("nag:");
+      const nagIntervalMinutes = isNagReminder
+        ? Math.max(5, parseInt(reminder.group_name.split(":")[1], 10) || 60)
+        : null;
+
+      if (isNagReminder) {
+        // Reschedule before sending so this row stays pending until the user says DONE.
+        // The conditional update also acts as an atomic claim if two dispatchers overlap.
+        const nextReminderTime = new Date(
+          Date.now() + nagIntervalMinutes * 60 * 1000
+        ).toISOString();
+
+        const { data: claimed } = await supabase
+          .from("personal_reminders")
+          .update({ reminder_time: nextReminderTime })
+          .eq("id", reminder.id)
+          .eq("status", "pending")
+          .lte("reminder_time", now)
+          .select("id");
+        if (!claimed?.length) continue;
+
+        try {
+          const body =
+            `🔔 ${reminder.message}\n\nReply *DONE* when finished, or *SNOOZE 30* to pause for 30 minutes.`;
+          await sendWhatsAppMessage(reminder.phone, body, scheduledMessageOptions());
+        } catch (_) {
+          // Restore the original due time so the next scheduler tick retries.
+          await supabase
+            .from("personal_reminders")
+            .update({ reminder_time: reminder.reminder_time })
+            .eq("id", reminder.id)
+            .eq("status", "pending");
+        }
+        continue;
+      }
+
+      // Standard one-off / finite interval reminders complete after being claimed.
       const { data: claimed } = await supabase
         .from("personal_reminders")
         .update({ status: "completed" })
@@ -94,9 +141,8 @@ async function runReminderDispatch() {
       if (!claimed?.length) continue;
 
       try {
-        await sendWhatsAppMessage(reminder.phone, reminder.message);
+        await sendWhatsAppMessage(reminder.phone, reminder.message, scheduledMessageOptions());
       } catch (_) {
-        // Revert so it retries next cycle
         await supabase.from("personal_reminders").update({ status: "pending" }).eq("id", reminder.id);
       }
     }
@@ -113,27 +159,27 @@ async function runRoutineDispatch() {
   routineRunning = true;
 
   try {
-    const { timeStr, todayIST } = getISTComponents();
+    const { timeStr, todayLocal } = getLocalComponents();
 
     const { data: routines } = await supabase
       .from("daily_routines")
       .select("*")
       .eq("is_active", true)
-      .or(`last_fired_date.is.null,last_fired_date.neq.${todayIST}`);
+      .or(`last_fired_date.is.null,last_fired_date.neq.${todayLocal}`);
 
     for (const routine of routines || []) {
       if (timeStr < routine.reminder_time.slice(0, 5)) continue;
 
       const { data: claimed } = await supabase
         .from("daily_routines")
-        .update({ last_fired_date: todayIST })
+        .update({ last_fired_date: todayLocal })
         .eq("id", routine.id)
-        .or(`last_fired_date.is.null,last_fired_date.neq.${todayIST}`)
+        .or(`last_fired_date.is.null,last_fired_date.neq.${todayLocal}`)
         .select("id");
       if (!claimed?.length) continue;
 
       try {
-        await sendWhatsAppMessage(routine.phone, routine.task_name);
+        await sendWhatsAppMessage(routine.phone, routine.task_name, scheduledMessageOptions());
       } catch (_) {
         await supabase.from("daily_routines").update({ last_fired_date: null }).eq("id", routine.id);
       }
@@ -151,13 +197,13 @@ async function runRecurringDispatch() {
   recurringRunning = true;
 
   try {
-    const { day, dayOfWeek, timeStr, todayIST } = getISTComponents();
+    const { day, dayOfWeek, timeStr, todayLocal } = getLocalComponents();
 
     const { data: tasks } = await supabase
       .from("recurring_tasks")
       .select("*")
       .eq("is_active", true)
-      .or(`last_fired_date.is.null,last_fired_date.neq.${todayIST}`);
+      .or(`last_fired_date.is.null,last_fired_date.neq.${todayLocal}`);
 
     for (const task of tasks || []) {
       if (timeStr < task.reminder_time.slice(0, 5)) continue;
@@ -166,10 +212,10 @@ async function runRecurringDispatch() {
       if (task.recurrence_type === "weekly") {
         shouldFire = task.day_of_week === dayOfWeek;
       } else if (task.recurrence_type === "monthly") {
-        const nowIST = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
-        const tomorrowIST = new Date(nowIST);
-        tomorrowIST.setDate(tomorrowIST.getDate() + 1);
-        const isLastDayOfMonth = tomorrowIST.getDate() === 1;
+        const nowLocal = new Date(new Date().toLocaleString("en-US", { timeZone: APP_TIMEZONE }));
+        const tomorrowLocal = new Date(nowLocal);
+        tomorrowLocal.setDate(tomorrowLocal.getDate() + 1);
+        const isLastDayOfMonth = tomorrowLocal.getDate() === 1;
         shouldFire = (isLastDayOfMonth && task.day_of_month > day) || task.day_of_month === day;
       }
 
@@ -177,14 +223,14 @@ async function runRecurringDispatch() {
 
       const { data: claimed } = await supabase
         .from("recurring_tasks")
-        .update({ last_fired_date: todayIST })
+        .update({ last_fired_date: todayLocal })
         .eq("id", task.id)
-        .or(`last_fired_date.is.null,last_fired_date.neq.${todayIST}`)
+        .or(`last_fired_date.is.null,last_fired_date.neq.${todayLocal}`)
         .select("id");
       if (!claimed?.length) continue;
 
       try {
-        await sendWhatsAppMessage(task.phone, task.task_name);
+        await sendWhatsAppMessage(task.phone, task.task_name, scheduledMessageOptions());
       } catch (_) {
         await supabase.from("recurring_tasks").update({ last_fired_date: null }).eq("id", task.id);
       }
@@ -206,12 +252,12 @@ cron.schedule("* * * * *", runReminderDispatch);
 cron.schedule("* * * * *", runRoutineDispatch);
 cron.schedule("* * * * *", runRecurringDispatch);
 
-// Special event alerts — 08:30 IST (03:00 UTC). Cron-only to avoid duplicates.
-cron.schedule("0 3 * * *", async () => {
+// Special event alerts — 08:30 in the configured local timezone.
+cron.schedule("30 8 * * *", async () => {
   if (eventAlertRunning) return;
   eventAlertRunning = true;
   try {
-    const { day: todayDay, month: todayMonth } = getISTComponents();
+    const { day: todayDay, month: todayMonth } = getLocalComponents();
 
     const tomorrowDate = new Date();
     tomorrowDate.setDate(tomorrowDate.getDate() + 1);
@@ -238,7 +284,7 @@ cron.schedule("0 3 * * *", async () => {
     eventAlertRunning = false;
     await recordHeartbeat("Event Alert");
   }
-});
+}, { timezone: APP_TIMEZONE });
 
 module.exports = {
   getHeartbeats: () => lastHeartbeats,
